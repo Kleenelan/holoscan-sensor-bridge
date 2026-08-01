@@ -97,12 +97,16 @@ void UdpTransmitterOp::start()
             host_buffer_.resize(total_sz);
             char* ptr = reinterpret_cast<char*>(host_buffer_.data());
             
-            cudaMemcpy(&host_buffer_.front(), tensor->data(), host_buffer_.size(), cudaMemcpyDeviceToHost);
+            cudaError_t cuda_status = cudaMemcpy(&host_buffer_.front(), tensor->data(), host_buffer_.size(), cudaMemcpyDeviceToHost);
+            if (cuda_status != cudaSuccess) {
+                HSB_LOG_ERROR("cudaMemcpy failed: {}", cudaGetErrorString(cuda_status));
+                break; 
+            }            
 
             int64_t offset = 0;
 
             while (offset < total_sz) {
-                int64_t current_chunk_size = std::min(max_buffer_size, total_sz - offset);
+                int64_t current_chunk_size = std::min(max_buffer_size_, total_sz - offset);
                 
                 // Send data via UDP
                 auto bytes = ::sendto(
@@ -113,10 +117,10 @@ void UdpTransmitterOp::start()
                     reinterpret_cast<sockaddr*>(&destination_address_),
                     sizeof(destination_address_));
 
-
-                if (bytes < 0)
-                    throw std::runtime_error(fmt::format("UDP send failed: {} (errno: {})", strerror(errno), errno));
-
+                if (bytes < 0) {
+                    HSB_LOG_ERROR("UDP send failed: {} (errno: {})", strerror(errno), errno);
+                    break;
+                }
                 offset += bytes;
 
             }
