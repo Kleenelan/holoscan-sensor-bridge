@@ -94,6 +94,9 @@ void UdpTransmitterOp::start()
             lock.unlock();
             cv_.notify_all();
             int64_t total_sz = tensor->nbytes();
+            if (total_sz == 0)
+                continue;
+            
             host_buffer_.resize(total_sz);
             char* ptr = reinterpret_cast<char*>(host_buffer_.data());
             
