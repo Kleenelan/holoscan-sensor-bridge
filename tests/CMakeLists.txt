@@ -44,10 +44,22 @@ function(ConfigureTest)
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<BUILD_INTERFACE:${BIN_DIR}/gtests>"
   )
 
+  # Base libraries every test historically linked. In native-only builds
+  # (HOLOLINK_BUILD_ONLY_NATIVE=ON) the Holoscan SDK is absent and the
+  # legacy `hololink` aggregation library is not compiled, so neither
+  # target exists; the Holoscan-free tests (module framework, emulator)
+  # link everything they need via CMAKE_TEST_LINK_LIBRARIES instead.
+  set(_hololink_test_base_libraries)
+  if(TARGET holoscan::core)
+    list(APPEND _hololink_test_base_libraries holoscan::core)
+  endif()
+  if(TARGET hololink)
+    list(APPEND _hololink_test_base_libraries hololink)
+  endif()
+
   target_link_libraries(${CMAKE_TEST_NAME}
     PRIVATE
-      holoscan::core
-      hololink
+      ${_hololink_test_base_libraries}
       GTest::gmock_main
       GTest::gtest_main
       ${CMAKE_TEST_LINK_LIBRARIES}
@@ -62,7 +74,11 @@ endfunction()
 
 # ##################################################################################################
 # * core tests ----------------------------------------------------------------------------------
-if (HOLOLINK_BUILD_ROCE)
+# These cases link the legacy Holoscan-coupled operators
+# (hololink::operators::iq_dec / iq_enc / sig_gen / roce_transmitter), which
+# native-only builds (HOLOLINK_BUILD_ONLY_NATIVE=ON, no Holoscan SDK) do not
+# compile — skip them there.
+if (HOLOLINK_BUILD_ROCE AND NOT HOLOLINK_BUILD_ONLY_NATIVE)
   ConfigureTest(
       hololink_iq_encoder_decoder_test
     SOURCES

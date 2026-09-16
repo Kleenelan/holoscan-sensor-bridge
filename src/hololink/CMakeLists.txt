@@ -20,4 +20,10 @@ add_subdirectory(common)
 add_subdirectory(expr_eval)
 add_subdirectory(operators)
 add_subdirectory(emulation)
+elseif (HOLOLINK_BUILD_EMULATOR)
+# The emulator libraries (hololink::emulation, hololink::emulation::sensors,
+# the per-transport libraries) are Holoscan-free — they only need CUDA,
+# dlpack and zlib — so native-only builds compile them too, both for
+# external simulator consumers and for the emulator unit tests in tests/.
+add_subdirectory(emulation)
 endif()

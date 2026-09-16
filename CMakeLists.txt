@@ -40,6 +40,22 @@ option(HOLOLINK_BUILD_GPUNETIO_ROCE "Build DOCA GPUNetIO RoCE transceiver (requi
 option(HOLOLINK_BUILD_SOCKET "Build Hololink with Linux Socket support" ON)
 option(HOLOLINK_ROCE_USE_GPU_VRAM "Prefer GPU VRAM for RoCE receiver frame buffers (requires GPUDirect RDMA). When OFF, always use pinned host memory, which avoids IOMMU write-access faults at the cost of an extra PCIe hop for GPU access." ON)
 
+# Native-only (HOLOLINK_BUILD_ONLY_NATIVE=ON) builds configure without the
+# Holoscan SDK. Components that cannot compile without it are force-disabled
+# here: the Python bindings link holoscan::pybind11, and the module
+# framework's Holoscan-coupled operators tree (hololink_module/host/operators)
+# links holoscan::core.
+if (HOLOLINK_BUILD_ONLY_NATIVE)
+  if (HOLOLINK_BUILD_PYTHON)
+    message(STATUS "hololink: HOLOLINK_BUILD_ONLY_NATIVE=ON — forcing HOLOLINK_BUILD_PYTHON=OFF (Python bindings require the Holoscan SDK)")
+    set(HOLOLINK_BUILD_PYTHON OFF CACHE BOOL "Build Hololink Python Bindings" FORCE)
+  endif()
+  if (HOLOLINK_MODULE_BUILD_OPERATORS)
+    message(STATUS "hololink: HOLOLINK_BUILD_ONLY_NATIVE=ON — forcing HOLOLINK_MODULE_BUILD_OPERATORS=OFF (module operators require the Holoscan SDK)")
+    set(HOLOLINK_MODULE_BUILD_OPERATORS OFF CACHE BOOL "Build hololink_module Holoscan-coupled operators" FORCE)
+  endif()
+endif()
+
 if (HOLOLINK_BUILD_PYTHON AND NOT HOLOLINK_BUILD_EMULATOR)
   message(FATAL_ERROR "If building Python bindings, HOLOLINK_BUILD_EMULATOR must be ON")
 endif()
@@ -65,6 +81,17 @@ list(APPEND CMAKE_MODULE_PATH ${hololink_SOURCE_DIR}/cmake)
 find_package(ibverbs QUIET)
 option(HOLOLINK_BUILD_ROCE "Build Hololink with RoCE support" ${ibverbs_FOUND})
 
+# The RoCE data plane is Holoscan-coupled: the module framework's
+# RoceReceiverV1 wraps the legacy roce_receiver operator
+# (hololink::operators::roce_receiver → holoscan::core), which native-only
+# builds do not compile. Force RoCE off so the module framework configures
+# without the Holoscan SDK; the Linux (socket) software receiver is
+# unaffected.
+if (HOLOLINK_BUILD_ONLY_NATIVE AND HOLOLINK_BUILD_ROCE)
+  message(STATUS "hololink: HOLOLINK_BUILD_ONLY_NATIVE=ON — forcing HOLOLINK_BUILD_ROCE=OFF (RoCE receiver requires the Holoscan SDK)")
+  set(HOLOLINK_BUILD_ROCE OFF CACHE BOOL "Build Hololink with RoCE support" FORCE)
+endif()
+
 # Find globally required dependencies
 if (NOT HOLOLINK_BUILD_ONLY_NATIVE)
   # Initialize CUDA architecture target list by precedence:
@@ -86,6 +113,14 @@ if (NOT HOLOLINK_BUILD_ONLY_NATIVE)
   else()
     add_compile_definitions(HOLOSCAN_LOG_ACTIVE_LEVEL=0)
   endif()
+else()
+  # Native-only builds get CUDAToolkit's imported targets
+  # (CUDA::cuda_driver & friends) at top-level scope here — in non-native
+  # builds they arrive as a side effect of find_package(holoscan) above.
+  # find_package imported targets are directory-scoped, so the
+  # per-subdirectory calls in src/hololink/core and hololink_module/host
+  # don't reach their siblings (e.g. hololink_module/module/core).
+  find_package(CUDAToolkit REQUIRED)
 endif()
 
 # if HSDK is present/used, fmt should discover HSDK's version, which is cleaner
@@ -113,21 +148,27 @@ endif()
 if(HOLOLINK_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+# The module framework (host adapter + per-board module .so files) is
+# Holoscan-free once HOLOLINK_MODULE_BUILD_OPERATORS is OFF (forced above
+# for native-only builds), so it configures in native-only builds too:
+# the adapter's Holoscan-coupled pieces — the legacy
+# `src/hololink/operators/` tree wrapped via module/core's RoceReceiverV1,
+# and the host/operators tree — are compiled out there. Container builds
+# that produce CLI tools (docker/Dockerfile.demo) set
+# HOLOLINK_BUILD_ONLY_NATIVE=ON and install nothing from the adapter.
+add_subdirectory(hololink_module)
+if(HOLOLINK_BUILD_TESTS)
+  # tests/CMakeLists.txt registers only the test cases whose dependencies
+  # exist in the current configuration: Holoscan-coupled cases (legacy
+  # operators, the module RoCE receiver operator, all Python cases) are
+  # skipped in native-only builds, everything else is always built.
+  add_subdirectory(tests)
+endif()
 if(NOT HOLOLINK_BUILD_ONLY_NATIVE)
-  # The adapter wraps the legacy `src/hololink/operators/` tree
-  # (currently for RoceReceiver, via module/core's RoceReceiverImplV1)
-  # which is itself gated on the native-only flag, so the adapter is
-  # also off in native-only builds. Container builds that produce CLI
-  # tools (docker/Dockerfile.demo) set HOLOLINK_BUILD_ONLY_NATIVE=ON
-  # and install nothing from the adapter.
-  add_subdirectory(hololink_module)
-  if(HOLOLINK_BUILD_TESTS)
-    add_subdirectory(tests)
-  endif()
   if(HOLOLINK_BUILD_PYTHON)
     add_subdirectory(python)
   endif()
-add_subdirectory(scripts)
+  add_subdirectory(scripts)
 endif()
 
 # Add packaging
