@@ -162,6 +162,7 @@ struct Options {
     bool verify_pattern = false; // check payload dwords i == expected[i]
     bool dump_first = false; // hex dump of first frame's head/metadata
     bool verbose = false;
+    int rtt_samples = 20; // control-plane RTT probe reads; 0 disables
 };
 
 void print_usage(const char* prog)
@@ -178,6 +179,7 @@ void print_usage(const char* prog)
         "      --no-config        do not program FPGA data-plane registers\n"
         "      --verify-pattern   verify payload against incrementing-dword pattern\n"
         "      --dump-first       hex dump head of first frame + its metadata\n"
+        "      --rtt=N            control-plane RTT probe samples (default 20, 0=off)\n"
         "  -v, --verbose          per-frame log lines\n"
         "  -h, --help\n",
         prog);
@@ -197,6 +199,7 @@ Options parse_args(int argc, char* argv[])
         { "no-config", no_argument, nullptr, 1001 },
         { "verify-pattern", no_argument, nullptr, 1002 },
         { "dump-first", no_argument, nullptr, 1003 },
+        { "rtt", required_argument, nullptr, 1004 },
         { "verbose", no_argument, nullptr, 'v' },
         { "help", no_argument, nullptr, 'h' },
         { nullptr, 0, nullptr, 0 }
@@ -214,6 +217,7 @@ Options parse_args(int argc, char* argv[])
         case 1001: o.configure_fpga = false; break;
         case 1002: o.verify_pattern = true; break;
         case 1003: o.dump_first = true; break;
+        case 1004: o.rtt_samples = std::stoi(optarg); break;
         case 'v': o.verbose = true; break;
         case 'h': print_usage(argv[0]); std::exit(0);
         default: print_usage(argv[0]); std::exit(1);
@@ -248,6 +252,14 @@ struct Stats {
     double interval_sum = 0, interval_min = 1e30, interval_max = 0, interval_sq = 0;
     uint64_t interval_count = 0;
     std::map<uint32_t, uint64_t> flag_values;
+    // FPGA 内部延迟：metadata 发出时刻 - 帧首数据到达时刻（同一 FPGA 时钟域，
+    // 无需与主机对时）。也就是帧在 FPGA 内部(缓存/打包/排队)的驻留时间。
+    double fpga_lat_sum = 0, fpga_lat_min = 1e30, fpga_lat_max = 0;
+    uint64_t fpga_lat_count = 0;
+    // 主机侧帧间隔（WC 轮询到的时间，CLOCK_MONOTONIC）：与 FPGA 侧帧间隔对比
+    // 可看出网络/NIC/驱动引入的排队抖动（不是绝对延迟）。
+    double host_int_sum = 0, host_int_min = 1e30, host_int_max = 0, host_int_sq = 0;
+    uint64_t host_int_count = 0;
 
     void add_interval(double dt_ns)
     {
@@ -256,6 +268,23 @@ struct Stats {
         interval_min = std::min(interval_min, dt_ns);
         interval_max = std::max(interval_max, dt_ns);
         interval_count++;
+    }
+
+    void add_fpga_latency(double ns)
+    {
+        fpga_lat_sum += ns;
+        fpga_lat_min = std::min(fpga_lat_min, ns);
+        fpga_lat_max = std::max(fpga_lat_max, ns);
+        fpga_lat_count++;
+    }
+
+    void add_host_interval(double dt_ns)
+    {
+        host_int_sum += dt_ns;
+        host_int_sq += dt_ns * dt_ns;
+        host_int_min = std::min(host_int_min, dt_ns);
+        host_int_max = std::max(host_int_max, dt_ns);
+        host_int_count++;
     }
 
     void print(const char* tag, double wall_s, uint64_t rx_write_requests) const
@@ -272,9 +301,20 @@ struct Stats {
         if (interval_count) {
             const double mean = interval_sum / interval_count;
             const double var = interval_sq / interval_count - mean * mean;
-            std::printf(" | frame interval mean %.3f ms min %.3f max %.3f jitter %.3f ms",
+            std::printf(" | fpga-interval mean %.3f ms min %.3f max %.3f jitter %.3f ms",
                 mean / 1e6, interval_min / 1e6, interval_max / 1e6,
                 std::sqrt(std::max(0.0, var)) / 1e6);
+        }
+        if (host_int_count) {
+            const double mean = host_int_sum / host_int_count;
+            const double var = host_int_sq / host_int_count - mean * mean;
+            std::printf(" | host-interval mean %.3f ms min %.3f max %.3f jitter %.3f ms",
+                mean / 1e6, host_int_min / 1e6, host_int_max / 1e6,
+                std::sqrt(std::max(0.0, var)) / 1e6);
+        }
+        if (fpga_lat_count) {
+            std::printf(" | fpga-latency mean %.2f us min %.2f max %.2f us",
+                fpga_lat_sum / fpga_lat_count / 1e3, fpga_lat_min / 1e3, fpga_lat_max / 1e3);
         }
         if (rx_write_requests != ~0ULL) {
             std::printf(" | nic rx_write_requests=%llu", (unsigned long long)rx_write_requests);
@@ -616,6 +656,33 @@ int main(int argc, char* argv[])
     // ------------------------------------------------------------------
     // 5. Completion loop.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 4b. 控制面 RTT 探测：读 HSB_IP_VERSION(0x80) 的 UDP 请求/应答往返，
+    //     作为主机↔FPGA 链路延迟的近似（含 FPGA 控制路径处理时间）。
+    // ------------------------------------------------------------------
+    if (opt.rtt_samples > 0) {
+        auto t = std::make_shared<hololink::Timeout>(5.f, 0.2f);
+        double best = 1e30, sum = 0, worst = 0;
+        int ok = 0;
+        for (int i = 0; i < opt.rtt_samples; i++) {
+            const double a = now_s();
+            try {
+                hololink->read_uint32(0x80, t);
+            } catch (const std::exception&) {
+                continue; // 丢事务重试失败的样本不计入
+            }
+            const double dt_ms = (now_s() - a) * 1e3;
+            best = std::min(best, dt_ms);
+            worst = std::max(worst, dt_ms);
+            sum += dt_ms;
+            ok++;
+        }
+        if (ok) {
+            std::printf("rtt: control-plane round-trip min %.3f ms avg %.3f ms max %.3f ms (%d/%d samples)\n",
+                best, sum / ok, worst, ok, opt.rtt_samples);
+        }
+    }
+
     if (opt.max_frames) {
         std::printf("receiving up to %llu frames... (Ctrl-C to stop)\n",
             (unsigned long long)opt.max_frames);
@@ -626,6 +693,8 @@ int main(int argc, char* argv[])
     signal(SIGTERM, on_sigint);
 
     Stats total {}, interval {};
+    bool have_last_host_ts = false;
+    double last_host_ts_ns = 0;
     const uint64_t rxw0 = read_rx_write_requests(ibdev.c_str(), opt.ibport);
     double t0 = now_s(), t_interval = t0;
     if (ibv_req_notify_cq(cq, 0)) {
@@ -675,6 +744,18 @@ int main(int argc, char* argv[])
         const uint8_t* frame = static_cast<const uint8_t*>(buffer) + page * page_size;
         const FrameMetadata m = parse_metadata(frame + metadata_offset);
 
+        // 主机侧到达时刻（尽量贴近 WC 轮询到的时间）
+        const double host_ts_ns = now_s() * 1e9;
+        if (have_last_host_ts) {
+            const double dt = host_ts_ns - last_host_ts_ns;
+            if (dt > 0) {
+                total.add_host_interval(dt);
+                interval.add_host_interval(dt);
+            }
+        }
+        last_host_ts_ns = host_ts_ns;
+        have_last_host_ts = true;
+
         Stats* s[2] = { &total, &interval };
         for (Stats* st : s) {
             st->frames++;
@@ -700,6 +781,11 @@ int main(int argc, char* argv[])
             }
             st->last_ts_ns = ts_ns;
             st->have_last_ts = true;
+            // FPGA 内部延迟：metadata 发出 - 帧首到达（同一 FPGA 时钟域）
+            const double meta_ns = m.metadata_s * 1e9 + m.metadata_ns;
+            if (meta_ns >= ts_ns) {
+                st->add_fpga_latency(meta_ns - ts_ns);
+            }
         }
 
         if (opt.verify_pattern) {

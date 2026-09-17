@@ -6,7 +6,8 @@
 #   - 用 $! 记录分析器 PID，采集完发 SIGINT 让其优雅收尾并 wait 到 TOTAL 打印完毕。
 set -u
 
-cd /home/ruler/ex_holoscan/tmp08_buils_hsb_test_no_hsdk/holoscan-sensor-bridge
+#cd /home/ruler/ex_holoscan/tmp08_buils_hsb_test_no_hsdk/holoscan-sensor-bridge
+echo "PWD is $PWD"
 export PATH=$PWD/build/tools/write:$PATH
 S=$PWD/tools/roce_ramplayer_analyzer
 
